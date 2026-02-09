@@ -1,0 +1,8 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^\.DS_Store$
+^stan/dlvm$
+^demo/
+^tests/
+^LICENSE$
+^README\.md$

@@ -1,0 +1,16 @@
+# Generated manually — not using roxygen2
+
+# Public API
+export(dlvm_prepare)
+export(dlvm_compile)
+export(dlvm_fit)
+export(dlvm_summary)
+export(dlvm_parameters)
+export(dlvm_diagnostics)
+export(dlvm_loo)
+export(dlvm_plot)
+export(dlvm_plot_ppc)
+export(dlvm_check_deps)
+export(dlvm_has_threads)
+export(dlvm_tbb_lib_path)
+export(dlvm_stan_path)

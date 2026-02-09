@@ -1,0 +1,26 @@
+Package: dlvm
+Title: Dynamic Latent Variable Model
+Version: 0.1.0
+Authors@R:
+    person("Charlie", "Carter", role = c("aut", "cre"),
+           email = "charlie@example.com")
+Description: Bayesian dynamic latent variable model for panel data with
+    irregular time spacing, variable observation counts per period, and
+    optional measurement uncertainty. Uses a random-walk latent process
+    with Student-t observation model, compiled and sampled via CmdStan.
+    Supports multi-threaded execution via TBB and reduce_sum.
+License: MIT + file LICENSE
+URL: https://github.com/charliecarter/dlvm
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.0
+Depends:
+    R (>= 4.1.0)
+Imports:
+    cmdstanr (>= 0.8.0),
+    data.table,
+    loo
+Suggests:
+    ggplot2,
+    testthat (>= 3.0.0)
+Additional_repositories: https://stan-dev.r-universe.dev

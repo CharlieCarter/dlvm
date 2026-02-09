@@ -35,6 +35,21 @@ Or let the package check for you:
 dlvm::dlvm_check_deps(install = TRUE)
 ```
 
+### First-time setup
+
+After installing, run the one-time CmdStan configuration. This auto-detects your
+platform and compiler, and writes the correct CmdStan `make/local` for your machine:
+
+```r
+library(dlvm)
+dlvm_setup_cmdstan()   # auto-detects platform, configures CmdStan
+dlvm_compile()         # first compile takes ~1 min, cached afterwards
+```
+
+On Linux and macOS with default Xcode tools, `dlvm_setup_cmdstan()` just enables
+threading. On macOS with Homebrew Clang, it automatically detects the conflict and
+configures CmdStan to use the system Apple Clang instead (see Platform Notes below).
+
 ## Quick Start
 
 ```r
@@ -85,85 +100,75 @@ The demo generates data for four use cases:
 
 ### Linux / HPC
 
-Typically works out of the box. CmdStan's bundled TBB and the system g++ are compatible:
+Works out of the box:
 
 ```r
-cmdstanr::install_cmdstan()
-library(dlvm)
-dlvm_compile()  # Just works
+dlvm_setup_cmdstan()  # enables threading, no other config needed
+dlvm_compile()
 ```
 
 ### macOS with Xcode Command Line Tools (default)
 
-Usually works without issues. Apple's Clang and system `libc++` are consistent:
+Works without issues. Apple's Clang and system `libc++` are consistent:
 
 ```r
-cmdstanr::install_cmdstan()
+dlvm_setup_cmdstan()  # enables threading
 ```
 
 ### macOS with Homebrew Clang (⚠️ common issue)
 
-If you've installed LLVM/Clang via Homebrew (e.g., `brew install llvm`), you may encounter **TBB linking failures** when compiling Stan models with `reduce_sum`. This happens because Homebrew's Clang uses its own `libc++` headers (newer C++17 ABI) but links against the system's `libc++.dylib` (older ABI), causing undefined symbol errors like:
+If you've installed LLVM/Clang via Homebrew (`brew install llvm`), you may
+encounter **TBB linking failures** or **header search path errors** when
+compiling Stan models. This happens because Homebrew's Clang uses its own
+`libc++` headers (newer ABI) but links against the system's `libc++.dylib`
+(older ABI).
 
+**Automatic fix:**
+
+```r
+dlvm_setup_cmdstan(force = TRUE)
+# → Detects Homebrew Clang, configures CmdStan to use /usr/bin/clang++ instead
 ```
-Undefined symbols:
-  "std::__1::__hash_memory::__hash_memory()"
-  "typeinfo for tbb::task"
-```
 
-#### The Fix
+**What it does:** `dlvm_setup_cmdstan()` detects Homebrew Clang in your PATH
+by checking `clang++ --version` for "Homebrew". When found, it writes a
+`make/local` that sets `CXX = /usr/bin/clang++` (Apple's system Clang), which
+avoids the ABI mismatch entirely. It also cleans any stale pre-compiled headers.
 
-Edit CmdStan's `make/local` file to force Homebrew's Clang to use the **system** C++ standard library headers instead of its own:
+**Manual alternative:** Edit `make/local` directly:
 
 ```bash
 # Find your CmdStan path:
 Rscript -e 'cat(cmdstanr::cmdstan_path())'
 
-# Edit make/local in that directory:
+# Edit make/local:
 nano ~/.cmdstan/cmdstan-2.38.0/make/local
 ```
 
-Add these lines (adjust paths for your system):
-
 ```makefile
-# Force Homebrew Clang to use system libc++ headers (fixes TBB ABI mismatch)
-CXXFLAGS += -nostdinc++ -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
+# Use system Apple Clang (avoids Homebrew ABI mismatch)
+CXX = /usr/bin/clang++
 
-# Enable threading for reduce_sum
+# Enable threading
 STAN_THREADS=true
 ```
 
-> **Why this works:** Homebrew's Clang ships its own `libc++` headers at
-> `/opt/homebrew/opt/llvm/include/c++/v1/` which define a newer ABI
-> (with symbols like `__hash_memory`). But the actual `libc++.dylib`
-> linked at runtime is Apple's system version, which doesn't have those
-> symbols. The `-nostdinc++` flag tells Clang to skip its own headers,
-> and `-isystem` points it to the system SDK headers that match the
-> system library.
-
-#### Runtime TBB Path
-
-If the model compiles but crashes at runtime with TBB errors, you may need to ensure CmdStan's bundled TBB is loaded instead of Homebrew's. The `dlvm_fit()` function handles this automatically by setting `DYLD_LIBRARY_PATH`, but if you're calling CmdStan directly, set:
+**How to tell if you have Homebrew Clang:**
 
 ```bash
-export DYLD_LIBRARY_PATH="$(Rscript -e 'cat(cmdstanr::cmdstan_path())')/stan/lib/stan_math/lib/tbb:$DYLD_LIBRARY_PATH"
-```
-
-#### How to tell if you have Homebrew Clang
-
-```bash
-which clang++
-# If /opt/homebrew/opt/llvm/bin/clang++ → Homebrew
-# If /usr/bin/clang++ → System (Xcode)
-
 clang++ --version
 # Homebrew: "Homebrew clang version 21.x.x"
 # System:   "Apple clang version 16.x.x"
 ```
 
+**Runtime TBB path:** If the model compiles but crashes at runtime,
+`dlvm_fit()` handles this automatically by setting `DYLD_LIBRARY_PATH`
+to CmdStan's bundled TBB.
+
 ### Windows
 
-Not tested, but should work via CmdStan's MSYS2/mingw64 toolchain. TBB issues are unlikely on Windows.
+Not tested, but should work via CmdStan's MSYS2/mingw64 toolchain. TBB
+issues are unlikely on Windows.
 
 ---
 

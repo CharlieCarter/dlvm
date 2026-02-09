@@ -199,6 +199,141 @@ dlvm_tbb_lib_path <- function() {
   if (dir.exists(tbb_path)) tbb_path else NULL
 }
 
+# ============================================================================
+# CmdStan setup helper
+# ============================================================================
+
+#' Configure CmdStan for dlvm (auto-detects platform issues)
+#'
+#' Detects your platform and compiler, then writes an appropriate
+#' CmdStan `make/local` configuration file. This is a one-time setup
+#' step that ensures Stan model compilation works correctly.
+#'
+#' On most systems (Linux, macOS with default Xcode tools, Windows),
+#' this amounts to enabling threading only. On macOS with Homebrew LLVM/Clang
+#' in the PATH, it configures CmdStan to use the system Apple Clang instead,
+#' avoiding a known ABI mismatch between Homebrew's libc++ headers and the
+#' system's libc++ runtime library.
+#'
+#' @param force Logical; if TRUE, overwrite existing make/local (default: FALSE)
+#' @param verbose Logical; if TRUE, print diagnostic information (default: TRUE)
+#' @return Invisible path to the make/local file
+#' @export
+dlvm_setup_cmdstan <- function(force = FALSE, verbose = TRUE) {
+  cmdstan_dir <- tryCatch(
+    cmdstanr::cmdstan_path(),
+    error = function(e) {
+      stop("[dlvm] CmdStan not found. Install it first:\n",
+           "  cmdstanr::install_cmdstan()")
+    }
+  )
+
+  make_local <- file.path(cmdstan_dir, "make", "local")
+
+  # If make/local exists and not forcing, warn
+
+  if (file.exists(make_local) && !force) {
+    existing <- readLines(make_local, warn = FALSE)
+    if (verbose) {
+      message("[dlvm] Existing make/local found at: ", make_local)
+      message("[dlvm] Contents:\n", paste("  ", existing, collapse = "\n"))
+      message("[dlvm] Use dlvm_setup_cmdstan(force = TRUE) to overwrite.")
+    }
+    return(invisible(make_local))
+  }
+
+  # Detect platform
+  os <- Sys.info()[["sysname"]]
+  arch <- Sys.info()[["machine"]]
+  config_lines <- character()
+  notes <- character()
+
+  if (os == "Darwin") {
+    # Check if Homebrew Clang is the default clang++
+    clang_path <- Sys.which("clang++")
+    clang_version <- tryCatch(
+      system2("clang++", "--version", stdout = TRUE, stderr = TRUE)[1],
+      error = function(e) ""
+    )
+    is_homebrew <- grepl("Homebrew|homebrew", clang_version, ignore.case = TRUE)
+
+    if (is_homebrew) {
+      # Homebrew Clang detected — use system Apple Clang instead
+      system_clang <- "/usr/bin/clang++"
+      if (!file.exists(system_clang)) {
+        stop("[dlvm] Homebrew Clang detected but system Clang not found at ",
+             system_clang, ".\n",
+             "  Install Xcode Command Line Tools: xcode-select --install")
+      }
+
+      config_lines <- c(
+        "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
+        paste0("# Detected Homebrew Clang at: ", clang_path),
+        "# Using system Apple Clang to avoid libc++ ABI mismatch",
+        paste0("CXX = ", system_clang),
+        "",
+        "# Enable threading for reduce_sum parallelisation",
+        "STAN_THREADS=true"
+      )
+      notes <- c(
+        "Detected: Homebrew Clang (may cause TBB/libc++ ABI conflicts)",
+        paste0("Fix: Using system Apple Clang at ", system_clang),
+        "Threading: enabled"
+      )
+    } else {
+      # System Apple Clang — just enable threading
+      config_lines <- c(
+        "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
+        "# System Apple Clang detected — no special config needed",
+        "",
+        "# Enable threading for reduce_sum parallelisation",
+        "STAN_THREADS=true"
+      )
+      notes <- c(
+        "Detected: System Apple Clang (no issues expected)",
+        "Threading: enabled"
+      )
+    }
+  } else if (os == "Linux") {
+    # Linux — typically works out of the box
+    config_lines <- c(
+      "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
+      "",
+      "# Enable threading for reduce_sum parallelisation",
+      "STAN_THREADS=true"
+    )
+    notes <- c("Detected: Linux (no special config needed)", "Threading: enabled")
+  } else {
+    # Windows or other
+    config_lines <- c(
+      "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
+      "",
+      "STAN_THREADS=true"
+    )
+    notes <- c(paste0("Detected: ", os), "Threading: enabled")
+  }
+
+  # Write make/local
+  writeLines(config_lines, make_local)
+
+  # Clean stale pre-compiled headers to ensure a fresh build
+  pch_dir <- file.path(cmdstan_dir, "stan", "src", "stan", "model",
+                       "model_header.hpp.gch")
+  if (dir.exists(pch_dir)) {
+    unlink(pch_dir, recursive = TRUE)
+    notes <- c(notes, "Cleaned stale pre-compiled headers")
+  }
+
+  if (verbose) {
+    message("[dlvm] CmdStan configured successfully:")
+    for (n in notes) message("  ", n)
+    message("  Config: ", make_local)
+    message("")
+    message("[dlvm] Next step: run dlvm_compile() to build the Stan model.")
+  }
+
+  invisible(make_local)
+}
 
 # Formatting helpers
 # ============================================================================

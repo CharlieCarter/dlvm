@@ -64,6 +64,9 @@ data {
 
   // --- Parallelisation tuning ---
   int<lower=1> grainsize;                  // reduce_sum grainsize (1 = auto)
+
+  // --- Optional generated quantities ---
+  int<lower=0,upper=1> compute_gq;         // 1 = compute log_lik/y_rep; 0 = skip for speed
 }
 
 transformed data {
@@ -135,23 +138,23 @@ model {
 }
 
 generated quantities {
-  // --- Pointwise log-likelihood for LOO-CV ---
-  vector[n_obs] log_lik;
+  int n_gq = compute_gq ? n_obs : 0;
+  vector[n_gq] log_lik;
+  vector[n_gq] y_rep;
 
-  // --- Posterior predictive draws ---
-  vector[n_obs] y_rep;
+  if (compute_gq) {
+    for (i in 1:n_obs) {
+      real mu_i = theta[obs_to_state[i]];
+      real sigma_eff_i;
 
-  for (i in 1:n_obs) {
-    real mu_i = theta[obs_to_state[i]];
-    real sigma_eff_i;
+      if (has_se) {
+        sigma_eff_i = sqrt(square(sigma) + square(se[i]));
+      } else {
+        sigma_eff_i = sigma;
+      }
 
-    if (has_se) {
-      sigma_eff_i = sqrt(square(sigma) + square(se[i]));
-    } else {
-      sigma_eff_i = sigma;
+      log_lik[i] = student_t_lpdf(y[i] | nu_obs, mu_i, sigma_eff_i);
+      y_rep[i] = student_t_rng(nu_obs, mu_i, sigma_eff_i);
     }
-
-    log_lik[i] = student_t_lpdf(y[i] | nu_obs, mu_i, sigma_eff_i);
-    y_rep[i] = student_t_rng(nu_obs, mu_i, sigma_eff_i);
   }
 }

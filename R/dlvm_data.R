@@ -43,7 +43,8 @@ dlvm_prepare <- function(data,
                          nu_obs = 4,
                          nu_state = 4,
                          scale_state = 4,
-                         grainsize = 1L) {
+                         grainsize = 1L,
+                         compute_gq = FALSE) {
 
   mode <- match.arg(mode)
 
@@ -205,7 +206,8 @@ dlvm_prepare <- function(data,
     nu_obs = nu_obs,
     nu_state = nu_state,
     scale_state = scale_state,
-    grainsize = as.integer(grainsize)
+    grainsize = as.integer(grainsize),
+    compute_gq = as.integer(compute_gq)
   )
 
   # --- Rename for user-facing output ---

@@ -22,6 +22,7 @@
 #' @param time_col Character; name of the column with time values (numeric or Date).
 #' @param value_col Character; name of the column with observed values (numeric).
 #' @param se_col Character or NULL; name of the column with known standard errors.
+#' @param se_correction Logical; if TRUE (default), use small-sample bias correction (Cureton/Holtzman) for SE.
 #' @param mode Character; one of "auto", "means", or "individual".
 #' @param nu_obs Numeric; degrees of freedom for observation distribution (default: 4).
 #' @param nu_state Numeric; degrees of freedom for state innovations (default: 4).
@@ -37,6 +38,7 @@ dlvm_prepare <- function(data,
                          time_col,
                          value_col,
                          se_col = NULL,
+                         se_correction = TRUE,
                          mode = c("auto", "means", "individual"),
                          nu_obs = 4,
                          nu_state = 4,
@@ -125,7 +127,16 @@ dlvm_prepare <- function(data,
       if (has_se) {
         agg_se <- sqrt(mean(ses^2, na.rm = TRUE)) / sqrt(n)
       } else {
-        agg_se <- if (n > 1) sd(vals, na.rm = TRUE) / sqrt(n) else 0
+        # Calculate SEM from sample SD
+        if (n > 1) {
+          if (se_correction) {
+            agg_se <- dlvm_se_cureton(vals, na.rm = TRUE)
+          } else {
+            agg_se <- sd(vals, na.rm = TRUE) / sqrt(n)
+          }
+        } else {
+          agg_se <- 0
+        }
       }
       data.frame(
         unit  = df$unit[idx[1]],

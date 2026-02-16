@@ -31,7 +31,10 @@ cat("DLVM root:", test_root, "\n")
 # Load DLVM — use library() if installed, source() for development
 if (requireNamespace("dlvm", quietly = TRUE)) {
   library(dlvm)
-  test_root <- system.file(package = "dlvm")
+  # Only use installed package location if we can't find tests locally
+  if (!dir.exists(file.path(test_root, "tests"))) {
+    test_root <- system.file(package = "dlvm")
+  }
 } else {
   for (f in list.files(file.path(test_root, "R"), pattern = "\\.R$", full.names = TRUE)) {
     source(f)
@@ -59,7 +62,9 @@ test_that <- function(desc, expr) {
 
 expect_true <- function(x) if (!isTRUE(x)) stop("Expected TRUE, got ", deparse(x))
 expect_false <- function(x) if (!isFALSE(x)) stop("Expected FALSE, got ", deparse(x))
-expect_equal <- function(a, b, tol = 1e-8) {
+expect_equal <- function(a, b, tol = 1e-8, ...) {
+  args <- list(...)
+  if ("tolerance" %in% names(args)) tol <- args$tolerance
   if (is.numeric(a) && is.numeric(b)) {
     if (any(abs(a - b) > tol, na.rm = TRUE)) stop(sprintf("Expected equal (tol=%g), got diff=%g", tol, max(abs(a - b), na.rm = TRUE)))
   } else if (!identical(a, b)) {
@@ -82,7 +87,8 @@ test_files <- list(
   data_prep  = "test_data_prep.R",
   simulation = "test_simulation.R",
   real_data  = "test_real_data.R",
-  edge_cases = "test_edge_cases.R"
+  edge_cases = "test_edge_cases.R",
+  cureton    = "test_cureton.R"
 )
 
 if (suite == "all") {

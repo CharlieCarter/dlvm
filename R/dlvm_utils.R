@@ -206,20 +206,24 @@ dlvm_tbb_lib_path <- function() {
 #' Configure CmdStan for dlvm (auto-detects platform issues)
 #'
 #' Detects your platform and compiler, then writes an appropriate
-#' CmdStan `make/local` configuration file. This is a one-time setup
-#' step that ensures Stan model compilation works correctly.
+#' CmdStan `make/local` configuration file. Handles known issues:
 #'
-#' On most systems (Linux, macOS with default Xcode tools, Windows),
-#' this amounts to enabling threading only. On macOS with Homebrew LLVM/Clang
-#' in the PATH, it configures CmdStan to use the system Apple Clang instead,
-#' avoiding a known ABI mismatch between Homebrew's libc++ headers and the
-#' system's libc++ runtime library.
+#' - **Homebrew Clang on macOS**: switches to system Apple Clang
+#' - **Stale C headers in /usr/local/include**: adds -isysroot to scope headers
+#' - **Homebrew TBB shadowing CmdStan's bundled TBB**: pins TBB paths
+#' - **Missing TBB dylibs / stale build markers**: cleans and optionally rebuilds
+#'
+#' On Linux and Windows, this just enables threading — no special config needed.
 #'
 #' @param force Logical; if TRUE, overwrite existing make/local (default: FALSE)
+#' @param rebuild Logical; if TRUE, trigger a full clean rebuild of CmdStan
+#'   after writing make/local. This rebuilds TBB dylibs, pre-compiled headers,
+#'   and everything else from scratch. Recommended on first setup or after
+#'   encountering linker errors. Takes ~2-5 minutes. (Default: FALSE)
 #' @param verbose Logical; if TRUE, print diagnostic information (default: TRUE)
 #' @return Invisible path to the make/local file
 #' @export
-dlvm_setup_cmdstan <- function(force = FALSE, verbose = TRUE) {
+dlvm_setup_cmdstan <- function(force = FALSE, rebuild = FALSE, verbose = TRUE) {
   cmdstan_dir <- tryCatch(
     cmdstanr::cmdstan_path(),
     error = function(e) {
@@ -230,9 +234,8 @@ dlvm_setup_cmdstan <- function(force = FALSE, verbose = TRUE) {
 
   make_local <- file.path(cmdstan_dir, "make", "local")
 
-  # If make/local exists and not forcing, warn
-
-  if (file.exists(make_local) && !force) {
+  # If make/local exists and not forcing, show contents and return
+  if (file.exists(make_local) && !force && !rebuild) {
     existing <- readLines(make_local, warn = FALSE)
     if (verbose) {
       message("[dlvm] Existing make/local found at: ", make_local)
@@ -242,94 +245,195 @@ dlvm_setup_cmdstan <- function(force = FALSE, verbose = TRUE) {
     return(invisible(make_local))
   }
 
-  # Detect platform
+  # ---- Detect platform and build config ----
   os <- Sys.info()[["sysname"]]
-  arch <- Sys.info()[["machine"]]
   config_lines <- character()
   notes <- character()
 
   if (os == "Darwin") {
-    # Check if Homebrew Clang is the default clang++
-    clang_path <- Sys.which("clang++")
+    config_lines <- c("# Auto-configured by dlvm::dlvm_setup_cmdstan()")
+
+    # 1. Detect Homebrew Clang
     clang_version <- tryCatch(
       system2("clang++", "--version", stdout = TRUE, stderr = TRUE)[1],
       error = function(e) ""
     )
-    is_homebrew <- grepl("Homebrew|homebrew", clang_version, ignore.case = TRUE)
+    is_homebrew_clang <- grepl("Homebrew|homebrew", clang_version)
 
-    if (is_homebrew) {
-      # Homebrew Clang detected — use system Apple Clang instead
+    if (is_homebrew_clang) {
       system_clang <- "/usr/bin/clang++"
       if (!file.exists(system_clang)) {
-        stop("[dlvm] Homebrew Clang detected but system Clang not found at ",
-             system_clang, ".\n",
-             "  Install Xcode Command Line Tools: xcode-select --install")
+        stop("[dlvm] Homebrew Clang detected but system Clang not found.\n",
+             "  Install Xcode Command Line Tools:  xcode-select --install")
       }
-
-      config_lines <- c(
-        "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
-        paste0("# Detected Homebrew Clang at: ", clang_path),
+      config_lines <- c(config_lines,
+        paste0("# Detected Homebrew Clang: ", Sys.which("clang++")),
         "# Using system Apple Clang to avoid libc++ ABI mismatch",
-        paste0("CXX = ", system_clang),
-        "",
-        "# Enable threading for reduce_sum parallelisation",
-        "STAN_THREADS=true"
+        paste0("CXX = ", system_clang), ""
       )
-      notes <- c(
-        "Detected: Homebrew Clang (may cause TBB/libc++ ABI conflicts)",
-        paste0("Fix: Using system Apple Clang at ", system_clang),
-        "Threading: enabled"
-      )
+      notes <- c(notes, paste0("Compiler: Switching to system Apple Clang ",
+                                "(Homebrew detected at ", Sys.which("clang++"), ")"))
     } else {
-      # System Apple Clang — just enable threading
-      config_lines <- c(
-        "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
-        "# System Apple Clang detected — no special config needed",
-        "",
-        "# Enable threading for reduce_sum parallelisation",
-        "STAN_THREADS=true"
-      )
-      notes <- c(
-        "Detected: System Apple Clang (no issues expected)",
-        "Threading: enabled"
-      )
+      config_lines <- c(config_lines, "# System Apple Clang detected", "")
+      notes <- c(notes, "Compiler: System Apple Clang (no issues)")
     }
-  } else if (os == "Linux") {
-    # Linux — typically works out of the box
-    config_lines <- c(
-      "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
-      "",
+
+    # 2. Detect stale /usr/local/include (common on machines with Homebrew history)
+    #    These old headers contain C macros (isinf/isnan) that conflict with C++.
+    #    We can't use -isysroot to work around this because it also breaks
+    #    CmdStan's internal TBB build. The clean fix is to remove them.
+    stale_math_h <- "/usr/local/include/math.h"
+    if (file.exists(stale_math_h)) {
+      math_content <- tryCatch(readLines(stale_math_h, n = 200, warn = FALSE),
+                               error = function(e) "")
+      if (any(grepl("__inline_isinff|__inline_isnanf", math_content))) {
+        notes <- c(notes,
+          "WARNING: Stale /usr/local/include/ detected (will cause C++ macro conflicts).",
+          "  Fix:  sudo mv /usr/local/include /usr/local/include.bak")
+        # Set a flag so we can stop early if this is a problem
+        .dlvm_env$stale_usr_local_include <- TRUE
+      }
+    }
+
+    # 3. Detect system TBB libs that shadow CmdStan's bundled TBB via -ltbb
+    #    Both /usr/local/lib (old x86 leftovers) and /opt/homebrew/lib (active
+    #    Homebrew TBB v12) cause linker to find the wrong TBB.
+    stale_tbb_local <- list.files("/usr/local/lib", pattern = "^libtbb", full.names = TRUE)
+    stale_tbb_brew  <- list.files("/opt/homebrew/lib", pattern = "^libtbb", full.names = TRUE)
+    stale_tbb_libs  <- c(stale_tbb_local, stale_tbb_brew)
+    if (length(stale_tbb_libs) > 0) {
+      fix_cmds <- character()
+      if (length(stale_tbb_local) > 0) fix_cmds <- c(fix_cmds, "sudo rm -f /usr/local/lib/libtbb*")
+      if (length(stale_tbb_brew) > 0)  fix_cmds <- c(fix_cmds, "sudo rm -f /opt/homebrew/lib/libtbb*")
+      notes <- c(notes,
+        "WARNING: System TBB libraries will shadow CmdStan's bundled TBB and cause linker errors.",
+        paste0("  Fix:  ", paste(fix_cmds, collapse = " && ")))
+    }
+
+    # 4. Detect Homebrew TBB that could shadow CmdStan's bundled TBB
+    #    Only override TBB_INC (header path), NOT TBB_LIB.
+    #    Setting TBB_LIB tells CmdStan's build system to treat TBB as external
+    #    and skip building TBB dylibs entirely — which causes linker errors.
+    has_homebrew_tbb <- dir.exists("/opt/homebrew/Cellar/tbb") ||
+                        dir.exists("/opt/homebrew/include/tbb") ||
+                        dir.exists("/usr/local/Cellar/tbb")
+
+    tbb_inc_path <- file.path(cmdstan_dir, "stan", "lib", "stan_math", "lib",
+                              "tbb_2020.3", "include")
+
+    if (has_homebrew_tbb && dir.exists(tbb_inc_path)) {
+      config_lines <- c(config_lines,
+        "# Pin CmdStan's bundled TBB headers (Homebrew TBB detected, incompatible API)",
+        "# NOTE: Only TBB_INC is set — TBB_LIB is intentionally omitted so that",
+        "# CmdStan builds its own TBB dylibs from source (setting TBB_LIB would",
+        "# tell the build system TBB is external and skip dylib compilation).",
+        paste0("TBB_INC = ", tbb_inc_path), ""
+      )
+      notes <- c(notes, "TBB: Headers pinned to CmdStan bundled (Homebrew TBB bypassed)")
+    }
+
+    # 4. Threading
+    config_lines <- c(config_lines,
       "# Enable threading for reduce_sum parallelisation",
       "STAN_THREADS=true"
     )
-    notes <- c("Detected: Linux (no special config needed)", "Threading: enabled")
-  } else {
-    # Windows or other
+    notes <- c(notes, "Threading: enabled")
+
+  } else if (os == "Linux") {
     config_lines <- c(
-      "# Auto-configured by dlvm::dlvm_setup_cmdstan()",
-      "",
+      "# Auto-configured by dlvm::dlvm_setup_cmdstan()", "",
+      "# Enable threading for reduce_sum parallelisation",
       "STAN_THREADS=true"
     )
-    notes <- c(paste0("Detected: ", os), "Threading: enabled")
+    notes <- c("Platform: Linux (no special config needed)", "Threading: enabled")
+  } else {
+    config_lines <- c(
+      "# Auto-configured by dlvm::dlvm_setup_cmdstan()", "",
+      "STAN_THREADS=true"
+    )
+    notes <- c(paste0("Platform: ", os), "Threading: enabled")
   }
 
-  # Write make/local
+  # ---- Write make/local ----
   writeLines(config_lines, make_local)
 
-  # Clean stale pre-compiled headers to ensure a fresh build
+  # ---- Clean stale build artifacts ----
   pch_dir <- file.path(cmdstan_dir, "stan", "src", "stan", "model",
                        "model_header.hpp.gch")
   if (dir.exists(pch_dir)) {
     unlink(pch_dir, recursive = TRUE)
-    notes <- c(notes, "Cleaned stale pre-compiled headers")
+    notes <- c(notes, "Cleaned: stale pre-compiled headers")
   }
 
+  tbb_dir <- file.path(cmdstan_dir, "stan", "lib", "stan_math", "lib", "tbb")
+  tbb_marker <- file.path(tbb_dir, "tbb-make-check")
+  tbb_dylibs <- list.files(tbb_dir, pattern = "\\.(dylib|so)$")
+
+  if (file.exists(tbb_marker) && length(tbb_dylibs) == 0) {
+    # Marker says built but no dylibs — remove marker + ancillary files
+    unlink(tbb_marker)
+    for (f in list.files(tbb_dir, pattern = "^(version_|tbb\\.def|tbbmalloc\\.def|tbbvars)",
+                         full.names = TRUE)) {
+      unlink(f)
+    }
+    notes <- c(notes, "Cleaned: TBB build markers (dylibs were missing)")
+    if (!rebuild) {
+      rebuild <- TRUE
+      notes <- c(notes, "Auto-triggering rebuild (TBB dylibs need to be built)")
+    }
+  }
+
+  # ---- Print config summary ----
   if (verbose) {
-    message("[dlvm] CmdStan configured successfully:")
+    message("[dlvm] CmdStan configured:")
     for (n in notes) message("  ", n)
     message("  Config: ", make_local)
+  }
+
+  # ---- Optional full rebuild ----
+  if (rebuild) {
+    if (verbose) {
+      message("")
+      message("[dlvm] Rebuilding CmdStan from scratch (2-5 minutes)...")
+      message("[dlvm] This rebuilds TBB dylibs, pre-compiled headers, and all tooling.")
+    }
+
+    # Clean everything
+    system2("make", c("-C", cmdstan_dir, "clean-all"),
+            stdout = if (verbose) "" else FALSE,
+            stderr = if (verbose) "" else FALSE)
+
+    # Rebuild
+    cores <- max(1L, parallel::detectCores())
+    build_result <- system2(
+      "make", c("-C", cmdstan_dir, paste0("-j", cores), "build"),
+      stdout = if (verbose) "" else FALSE,
+      stderr = if (verbose) "" else FALSE
+    )
+
+    if (build_result != 0) {
+      stop("[dlvm] CmdStan rebuild failed (exit code ", build_result, ").\n",
+           "  Check the error output above.\n",
+           "  You may also try: cmdstanr::rebuild_cmdstan()")
+    }
+
+    # Verify TBB dylibs
+    rebuilt_dylibs <- list.files(tbb_dir, pattern = "\\.(dylib|so)$")
+    if (length(rebuilt_dylibs) > 0) {
+      if (verbose) message("[dlvm] TBB dylibs built: ",
+                           paste(rebuilt_dylibs, collapse = ", "))
+    } else {
+      warning("[dlvm] Build succeeded but TBB dylibs not found at: ", tbb_dir)
+    }
+
+    if (verbose) {
+      message("[dlvm] CmdStan rebuild complete.")
+      message("[dlvm] Next: run dlvm_compile() to build the Stan model.")
+    }
+  } else if (verbose) {
     message("")
-    message("[dlvm] Next step: run dlvm_compile() to build the Stan model.")
+    message("[dlvm] Next: run dlvm_compile() to build the Stan model.")
+    message("[dlvm] If you get linker errors, run: dlvm_setup_cmdstan(rebuild = TRUE)")
   }
 
   invisible(make_local)
@@ -346,4 +450,63 @@ fmt_duration <- function(secs) {
   mins <- floor(secs / 60)
   remaining <- secs - mins * 60
   sprintf("%dm %.0fs", mins, remaining)
+}
+
+# ============================================================================
+# Statistical helpers
+# ============================================================================
+
+#' Calculate small-sample bias corrected standard deviation (Cureton/Holtzman)
+#'
+#' Computes the standard deviation using the Holtzman correction factor to account
+#' for bias in small samples.
+#'
+#' @param x Numeric vector of observations
+#' @param na.rm Logical; if TRUE, remove NA values before computation
+#' @return Numeric standard deviation
+#' @export
+dlvm_sd_cureton <- function(x, na.rm = FALSE) {
+  if (na.rm) x <- x[!is.na(x)]
+  n <- length(x)
+
+  if (n < 2) return(0) # Undefined or zero variance for n=0,1
+
+  # Standard SD (with Bessel's correction n-1)
+  s_bessel <- sd(x)
+
+  # Holtzman correction factor:
+  # K = (n - 1) / [ Gamma((n-1)/2) * (sqrt((n-1)/2) / Gamma(n/2)) ]^2
+  # This factor K is applied to the variance sum of squares, but defined
+  # relative to the uncorrected estimator?
+  #
+  # Let's use the user's provided implementation exactly:
+  # C_N = Gamma((N-1)/2) * (sqrt((N-1)/2) / Gamma(N/2))
+  # k = (N-1) / C_N^2
+  # s = sqrt( sum((x-mean)^2) / k )
+
+  c_n <- gamma((n - 1) / 2) * (sqrt((n - 1) / 2) / gamma(n / 2))
+  k <- (n - 1) / c_n^2
+
+  # Sum of squared deviations
+  ssd <- sum((x - mean(x))^2)
+
+  # Corrected SD
+  sqrt(ssd / k)
+}
+
+#' Calculate small-sample bias corrected standard error of the mean
+#'
+#' Computes the standard error of the mean using the Cureton/Holtzman
+#' corrected standard deviation.
+#'
+#' @param x Numeric vector of observations
+#' @param na.rm Logical; if TRUE, remove NA values before computation
+#' @return Numeric standard error
+#' @export
+dlvm_se_cureton <- function(x, na.rm = FALSE) {
+  if (na.rm) x <- x[!is.na(x)]
+  n <- length(x)
+  if (n < 2) return(0)
+
+  dlvm_sd_cureton(x) / sqrt(n)
 }

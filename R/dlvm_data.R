@@ -118,6 +118,18 @@ dlvm_prepare <- function(data,
 
   if (mode == "means" && max_rows_per_ut > 1) {
     message("[dlvm] mode='means' but multiple rows per unit-time found. Aggregating to means.")
+
+    # Compute global sigma_hat as proxy SE for n=1 cells.
+    # A single observation is one draw from the observation distribution,
+    # so sd(y) is the right order-of-magnitude uncertainty for it as an
+    # estimator of theta.  Setting SE=0 (as before) would paradoxically
+    # give n=1 cells maximum precision — more influence than well-measured
+    # means from many observations.
+    sigma_hat <- sd(df$value, na.rm = TRUE)
+
+    # Count how many n=1 cells we have (for diagnostics)
+    n1_count <- sum(vapply(split(seq_len(nrow(df)), ut_key), length, integer(1)) == 1L)
+
     # Aggregate using base R split/lapply
     split_idx <- split(seq_len(nrow(df)), ut_key)
     agg_list <- lapply(split_idx, function(idx) {
@@ -136,7 +148,8 @@ dlvm_prepare <- function(data,
             agg_se <- sd(vals, na.rm = TRUE) / sqrt(n)
           }
         } else {
-          agg_se <- 0
+          # n=1: use global sigma_hat as proxy SE
+          agg_se <- sigma_hat
         }
       }
       data.frame(
@@ -144,6 +157,7 @@ dlvm_prepare <- function(data,
         time  = df$time[idx[1]],
         value = mean_val,
         se    = agg_se,
+        obs_n = n,
         stringsAsFactors = FALSE
       )
     })
@@ -151,7 +165,10 @@ dlvm_prepare <- function(data,
     rownames(df) <- NULL
     if (!has_se) {
       has_se <- TRUE
-      message("[dlvm] Computed SEM from within-group standard deviation during aggregation.")
+      message(sprintf(
+        "[dlvm] Computed SEM from within-group SD during aggregation (%d of %d cells used sigma_hat=%.4f proxy for n=1).",
+        n1_count, length(split_idx), sigma_hat
+      ))
     }
   }
 
@@ -193,6 +210,17 @@ dlvm_prepare <- function(data,
   n_obs <- nrow(df)
   se_final <- if (has_se) df$se else rep(0, n_obs)
 
+  # --- Compute obs_n (observation count per cell) ---
+  # In individual mode, each row is one observation → obs_n = 1.
+  # In aggregated means mode, obs_n was computed during aggregation.
+  # If data was already pre-aggregated (1 row per unit-time from the start),
+  # obs_n defaults to 1 (no averaging benefit to claim).
+  if ("obs_n" %in% names(df)) {
+    obs_n_vec <- as.integer(df$obs_n)
+  } else {
+    obs_n_vec <- rep(1L, n_obs)
+  }
+
   stan_data <- list(
     n_states = n_states,
     n_obs = n_obs,
@@ -201,6 +229,7 @@ dlvm_prepare <- function(data,
     obs_to_state = as.integer(df$state_id),
     has_se = as.integer(has_se && any(se_final > 0)),
     se = se_final,
+    obs_n = obs_n_vec,
     state_prev = as.integer(state_grid$prev_state_id),
     delta_t = state_grid$delta_t,
     nu_obs = nu_obs,

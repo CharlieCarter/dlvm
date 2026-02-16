@@ -4,6 +4,8 @@
 //   - Non-centered student-t random walk (robust innovations)
 //   - Continuous-time support via delta_t scaling
 //   - Optional known measurement error (SEM)
+//   - Observation-count scaling: sigma is per-document noise,
+//     means of n documents have noise sigma/sqrt(n)
 //   - Dual observation modes: pre-aggregated means OR individual observations
 //   - Within-chain parallelisation via reduce_sum
 //   - Generated quantities for LOO-CV and posterior predictive checks
@@ -12,8 +14,8 @@
 //   State:   theta[t] = theta[t-1] + innov * sqrt(delta_t) * z[t]
 //            z[t] ~ student_t(nu_state, 0, scale_state)
 //   Obs:     y[i] ~ student_t(nu_obs, theta[cy_id[i]], sigma_eff[i])
-//            sigma_eff[i] = sqrt(sigma^2 + se[i]^2)  if SEM known
-//            sigma_eff[i] = sigma                     if SEM unknown
+//            sigma_eff[i] = sqrt(sigma^2/obs_n[i] + se[i]^2)  if SEM known
+//            sigma_eff[i] = sigma / sqrt(obs_n[i])             if SEM unknown
 
 functions {
   /**
@@ -53,6 +55,12 @@ data {
   int<lower=0,upper=1> has_se;             // 1 if standard errors are provided
   vector<lower=0>[n_obs] se;               // known SEs (zeros if not provided)
 
+  // --- Observation counts per cell (for means-mode sigma/sqrt(n) scaling) ---
+  // In individual mode, all values are 1 and sigma_eff == sigma.
+  // In means mode, obs_n[i] is the number of raw observations aggregated
+  // into datum i, so that sigma_eff = sigma / sqrt(obs_n[i]).
+  array[n_obs] int<lower=1> obs_n;
+
   // --- State structure ---
   array[n_states] int<lower=0,upper=n_states> state_prev;  // predecessor index (0 = no predecessor)
   vector<lower=0>[n_states] delta_t;       // time gap to predecessor (0 for initial states)
@@ -75,6 +83,7 @@ transformed data {
   // (matches the original model's logic for initialising new chains)
   vector[n_states] state_nu;
   array[n_obs] int seq_obs;                // dummy index array for reduce_sum
+  vector[n_obs] sqrt_obs_n;                // pre-computed sqrt(obs_n) for efficiency
 
   for (s in 1:n_states) {
     state_nu[s] = (state_prev[s] == 0) ? 4.0 : nu_state;
@@ -82,13 +91,16 @@ transformed data {
 
   for (i in 1:n_obs) {
     seq_obs[i] = i;
+    sqrt_obs_n[i] = sqrt(obs_n[i]);
   }
+
+  int n_gq = compute_gq ? n_obs : 0;
 }
 
 parameters {
   vector[n_states] theta_raw;             // non-centered innovation draws
   real<lower=0> innov;                    // global innovation scale
-  real<lower=0> sigma;                    // observation noise scale
+  real<lower=0> sigma;                    // per-document observation noise scale
 }
 
 transformed parameters {
@@ -121,13 +133,16 @@ model {
     mu[i] = theta[obs_to_state[i]];
   }
 
-  // Compute effective observation scale: sqrt(sigma^2 + se^2)
+  // Compute effective observation scale: sigma/sqrt(n), with optional SE
+  // sigma is per-document noise; the mean of n docs has noise sigma/sqrt(n)
   if (has_se) {
     for (i in 1:n_obs) {
-      sigma_eff[i] = sqrt(square(sigma) + square(se[i]));
+      sigma_eff[i] = sqrt(square(sigma) / obs_n[i] + square(se[i]));
     }
   } else {
-    sigma_eff = rep_vector(sigma, n_obs);
+    for (i in 1:n_obs) {
+      sigma_eff[i] = sigma / sqrt_obs_n[i];
+    }
   }
 
   // Parallelised log-likelihood via reduce_sum
@@ -138,7 +153,6 @@ model {
 }
 
 generated quantities {
-  int n_gq = compute_gq ? n_obs : 0;
   vector[n_gq] log_lik;
   vector[n_gq] y_rep;
 
@@ -148,9 +162,9 @@ generated quantities {
       real sigma_eff_i;
 
       if (has_se) {
-        sigma_eff_i = sqrt(square(sigma) + square(se[i]));
+        sigma_eff_i = sqrt(square(sigma) / obs_n[i] + square(se[i]));
       } else {
-        sigma_eff_i = sigma;
+        sigma_eff_i = sigma / sqrt_obs_n[i];
       }
 
       log_lik[i] = student_t_lpdf(y[i] | nu_obs, mu_i, sigma_eff_i);

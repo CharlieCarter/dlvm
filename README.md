@@ -78,6 +78,44 @@ dlvm_plot_ppc(fit)                  # Posterior predictive check
 loo_result <- dlvm_loo(fit)
 ```
 
+### Observation Families
+
+DLVM supports four observation distribution families:
+
+```r
+# Continuous data — Student-t observation model (default)
+prep <- dlvm_prepare(my_data, "country", "year", "score",
+                     family = "student_t")
+
+# Ordinal ratings (1..K, K auto-detected from data)
+prep <- dlvm_prepare(my_data, "country", "year", "rating",
+                     family = "cumulative")
+
+# Individual binary outcomes (0/1)
+prep <- dlvm_prepare(my_data, "country", "year", "sympathetic",
+                     family = "bernoulli")
+
+# Counts: k of n successes
+prep <- dlvm_prepare(my_data, "country", "year", "n_sympathetic",
+                     trials_col = "n_articles", family = "binomial")
+```
+
+Data-type aliases are also accepted: `"continuous"` → `"student_t"`, `"ordinal"` → `"cumulative"`, `"binary"` → `"bernoulli"`.
+
+### Tuning Parameters: `nu_obs` vs `nu_state`
+
+The model uses two separate Student-t distributions with independently controllable degrees of freedom:
+
+| Parameter | Controls | Default | Purpose |
+|---|---|---|---|
+| `nu_obs` | Observation distribution tails | 4 | How much a single extreme observation can pull θ. Lower = more robust to outlier observations. |
+| `nu_state` | Innovation distribution tails | 4 | How large structural breaks in the latent trajectory can be. Lower = more tolerant of abrupt regime shifts. |
+
+Both are passed as data (not estimated). Setting either to ≥ 30 is effectively Gaussian.
+
+> **TODO**: Systematic simulation study exploring the impact of `nu_obs` on latent state recovery
+> under different outlier regimes (Student-t observation vs. Gaussian observation).
+
 ## Demos
 
 Run the showcase from the package source directory:
@@ -182,10 +220,14 @@ dlvm/
 │   ├── dlvm_data.R      # dlvm_prepare() — data validation + Stan data list
 │   ├── dlvm_fit.R       # dlvm_fit() — CmdStan sampling wrapper
 │   ├── dlvm_results.R   # dlvm_summary/plot/diagnostics/loo
-│   ├── dlvm_utils.R     # Compilation, path resolution, TBB helpers
+│   ├── dlvm_utils.R     # Family resolution, compilation, path helpers
 │   └── zzz.R            # Package load hooks
 ├── inst/stan/
-│   └── dlvm.stan        # The Stan model
+│   ├── dlvm.stan            # Legacy Student-t model (backward compat)
+│   ├── dlvm_student_t.stan  # Student-t observation family
+│   ├── dlvm_cumulative.stan # Ordinal (ordered logistic) family
+│   ├── dlvm_bernoulli.stan  # Binary (Bernoulli logit) family
+│   └── dlvm_binomial.stan   # Binomial (count/proportion) family
 ├── demo/
 │   └── demo_showcase.R  # 4 demo scenarios with ggplot visualisations
 └── tests/

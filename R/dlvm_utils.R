@@ -5,42 +5,96 @@
 # and path resolution helpers.
 
 # ============================================================================
+# Family resolution
+# ============================================================================
+
+# Valid primary family names (distribution-accurate, following brms conventions)
+.dlvm_families <- c("student_t", "cumulative", "bernoulli", "binomial")
+
+# Data-type aliases accepted silently
+.dlvm_family_aliases <- c(
+  continuous = "student_t",
+  ordinal    = "cumulative",
+  binary     = "bernoulli"
+)
+
+#' Resolve and validate a family argument
+#'
+#' Accepts primary distribution names or data-type aliases.
+#' Rejects 'gaussian' with an informative error.
+#'
+#' @param family Character string.
+#' @return Validated canonical family name.
+#' @keywords internal
+.resolve_family <- function(family) {
+  family <- tolower(trimws(family))
+
+  # Reject gaussian with helpful message
+  if (family == "gaussian") {
+    stop("[dlvm] DLVM uses Student-t, not Gaussian, for continuous data. ",
+         "Use family = 'student_t' (or the alias 'continuous').")
+  }
+
+  # Resolve aliases
+  if (family %in% names(.dlvm_family_aliases)) {
+    family <- .dlvm_family_aliases[[family]]
+  }
+
+  # Validate
+  if (!family %in% .dlvm_families) {
+    stop("[dlvm] Unknown family '", family, "'. ",
+         "Valid families: ", paste(.dlvm_families, collapse = ", "),
+         ". Aliases: ", paste(names(.dlvm_family_aliases), collapse = ", "), ".")
+  }
+
+  family
+}
+
+# ============================================================================
 # Path resolution
 # ============================================================================
 
-#' Get path to the Stan model file
+#' Get path to a DLVM Stan model file
 #'
-#' Resolves the path to dlvm.stan, checking (in order):
+#' Resolves the path to the Stan model for the given family, checking (in order):
 #' 1. Installed package location (via system.file)
 #' 2. Development layout: inst/stan/ relative to package source root
 #' 3. Legacy layout: stan/ relative to working directory
 #'
-#' @return Absolute path to dlvm.stan
+#' @param family Character; observation family name (default: "student_t").
+#' @return Absolute path to the Stan model file.
 #' @export
-dlvm_stan_path <- function() {
+dlvm_stan_path <- function(family = "student_t") {
+  family <- .resolve_family(family)
+  stan_file <- paste0("dlvm_", family, ".stan")
+
   # 1. Installed package
-  installed <- system.file("stan", "dlvm.stan", package = "dlvm")
+  installed <- system.file("stan", stan_file, package = "dlvm")
   if (nzchar(installed)) return(installed)
 
   # 2. Development: inst/stan/ relative to package source root
   dev_candidates <- c(
-    file.path("inst", "stan", "dlvm.stan"),
-    file.path(".", "inst", "stan", "dlvm.stan")
+    file.path("inst", "stan", stan_file),
+    file.path(".", "inst", "stan", stan_file)
   )
   for (cand in dev_candidates) {
     if (file.exists(cand)) return(normalizePath(cand))
   }
 
-  # 3. Legacy layout (stan/ in working directory)
-  legacy_candidates <- c(
-    file.path("stan", "dlvm.stan"),
-    file.path(".", "stan", "dlvm.stan")
-  )
-  for (cand in legacy_candidates) {
-    if (file.exists(cand)) return(normalizePath(cand))
+  # 3. Legacy layout (stan/ in working directory) — student_t falls back to dlvm.stan
+  if (family == "student_t") {
+    legacy_candidates <- c(
+      file.path("stan", "dlvm.stan"),
+      file.path(".", "stan", "dlvm.stan"),
+      file.path("inst", "stan", "dlvm.stan"),
+      file.path(".", "inst", "stan", "dlvm.stan")
+    )
+    for (cand in legacy_candidates) {
+      if (file.exists(cand)) return(normalizePath(cand))
+    }
   }
 
-  stop("[dlvm] Cannot locate dlvm.stan. ",
+  stop("[dlvm] Cannot locate ", stan_file, ". ",
        "If using as installed package, reinstall with devtools::install(). ",
        "If developing, run from the dlvm/ source directory.")
 }
@@ -103,27 +157,36 @@ dlvm_check_deps <- function(install = FALSE) {
 
 # .dlvm_env is defined in zzz.R (package-level object)
 
-#' Compile the DLVM Stan model
+#' Compile a DLVM Stan model
 #'
-#' Compiles the model using CmdStan's make system directly (which correctly
-#' handles TBB linking for reduce_sum parallelisation on all platforms),
-#' then wraps the pre-compiled binary in a cmdstanr CmdStanModel object.
+#' Compiles the model for the specified observation family using CmdStan's
+#' make system directly (which correctly handles TBB linking for reduce_sum
+#' parallelisation on all platforms), then wraps the pre-compiled binary
+#' in a cmdstanr CmdStanModel object.
 #'
 #' The compiled binary is stored alongside the .stan file and reused across
 #' R sessions unless force=TRUE or the .stan file has been modified.
+#' Models are cached per-family, so compiling a different family does not
+#' invalidate the cache for other families.
 #'
+#' @param family Character; observation family (default: "student_t").
+#'   Valid values: "student_t", "cumulative", "bernoulli", "binomial".
+#'   Aliases: "continuous", "ordinal", "binary".
 #' @param force Logical; if TRUE, recompile even if cached
 #' @param quiet Logical; if TRUE, suppress compilation messages
 #' @param threads Logical; if TRUE (default), compile with threading support
 #' @return A CmdStanModel object
 #' @export
-dlvm_compile <- function(force = FALSE, quiet = FALSE, threads = TRUE) {
-  if (!force && exists("model", envir = .dlvm_env)) {
-    if (!quiet) message("[dlvm] Using cached compiled model.")
-    return(.dlvm_env$model)
+dlvm_compile <- function(family = "student_t", force = FALSE, quiet = FALSE, threads = TRUE) {
+  family <- .resolve_family(family)
+  cache_key <- paste0("model_", family)
+
+  if (!force && exists(cache_key, envir = .dlvm_env)) {
+    if (!quiet) message(sprintf("[dlvm] Using cached compiled model (family: %s).", family))
+    return(.dlvm_env[[cache_key]])
   }
 
-  stan_file <- dlvm_stan_path()
+  stan_file <- dlvm_stan_path(family)
   if (!file.exists(stan_file)) {
     stop("[dlvm] Stan model not found at: ", stan_file)
   }
@@ -134,7 +197,7 @@ dlvm_compile <- function(force = FALSE, quiet = FALSE, threads = TRUE) {
   # Check if we can skip compilation (binary exists and is newer than .stan)
   if (!force && file.exists(exe_file) &&
       file.mtime(exe_file) > file.mtime(stan_file)) {
-    if (!quiet) message("[dlvm] Using existing compiled binary.")
+    if (!quiet) message(sprintf("[dlvm] Using existing compiled binary (family: %s).", family))
   } else {
     # Compile via CmdStan's make system, which handles TBB linking correctly
     cmdstan_dir <- cmdstanr::cmdstan_path()
@@ -150,7 +213,7 @@ dlvm_compile <- function(force = FALSE, quiet = FALSE, threads = TRUE) {
 
     if (!quiet) {
       threading_str <- if (threads) "with threading" else "without threading"
-      message(sprintf("[dlvm] Compiling Stan model %s via CmdStan make...", threading_str))
+      message(sprintf("[dlvm] Compiling Stan model (family: %s) %s via CmdStan make...", family, threading_str))
     }
 
     result <- system(make_cmd, intern = FALSE, ignore.stdout = quiet, ignore.stderr = quiet)
@@ -173,10 +236,10 @@ dlvm_compile <- function(force = FALSE, quiet = FALSE, threads = TRUE) {
     cpp_options = if (threads) list(stan_threads = TRUE) else list()
   )
 
-  .dlvm_env$model <- mod
+  .dlvm_env[[cache_key]] <- mod
   .dlvm_env$has_threads <- threads
   threading_str <- if (threads) "with threading" else "without threading"
-  if (!quiet) message(sprintf("[dlvm] Compilation successful (%s). Binary cached for this session.", threading_str))
+  if (!quiet) message(sprintf("[dlvm] Compilation successful (family: %s, %s). Binary cached for this session.", family, threading_str))
   return(mod)
 }
 

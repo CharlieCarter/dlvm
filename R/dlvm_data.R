@@ -20,25 +20,34 @@
 #' @param data A data.frame or data.table with at least unit, time, and value columns.
 #' @param unit_col Character; name of the column identifying units (e.g., "country").
 #' @param time_col Character; name of the column with time values (numeric or Date).
-#' @param value_col Character; name of the column with observed values (numeric).
-#' @param se_col Character or NULL; name of the column with known standard errors.
-#' @param se_correction Logical; if TRUE (default), use small-sample bias correction (Cureton/Holtzman) for SE.
+#' @param value_col Character; name of the column with observed values.
+#'   For student_t: numeric. For cumulative: integer 1..K or factor.
+#'   For bernoulli: integer 0/1. For binomial: integer (successes).
+#' @param se_col Character or NULL; column with known standard errors (student_t only).
+#' @param trials_col Character or NULL; column with trial counts (binomial family only).
+#' @param se_correction Logical; if TRUE (default), use small-sample bias correction for SE.
+#' @param family Character; observation distribution family (default: "student_t").
+#'   Primary values: "student_t", "cumulative", "bernoulli", "binomial".
+#'   Aliases: "continuous" (→ student_t), "ordinal" (→ cumulative), "binary" (→ bernoulli).
 #' @param mode Character; one of "auto", "means", or "individual".
-#' @param nu_obs Numeric; degrees of freedom for observation distribution (default: 4).
+#' @param nu_obs Numeric; degrees of freedom for observation distribution (default: 4, student_t only).
 #' @param nu_state Numeric; degrees of freedom for state innovations (default: 4).
 #' @param scale_state Numeric; scale for state innovation prior (default: 4).
 #' @param grainsize Integer; reduce_sum grainsize (default: 1 = automatic).
+#' @param compute_gq Logical; compute generated quantities (default: FALSE).
 #'
 #' @return A list with components:
 #'   \item{stan_data}{Named list ready to pass to CmdStanR's $sample()}
-#'   \item{metadata}{List with unit labels, time values, and mapping info}
+#'   \item{metadata}{List with unit labels, time values, family, and mapping info}
 #' @export
 dlvm_prepare <- function(data,
                          unit_col,
                          time_col,
                          value_col,
                          se_col = NULL,
+                         trials_col = NULL,
                          se_correction = TRUE,
+                         family = "student_t",
                          mode = c("auto", "means", "individual"),
                          nu_obs = 4,
                          nu_state = 4,
@@ -47,16 +56,20 @@ dlvm_prepare <- function(data,
                          compute_gq = FALSE) {
 
   mode <- match.arg(mode)
+  family <- .resolve_family(family)
 
   # --- Input validation ---
-  .validate_inputs(data, unit_col, time_col, value_col, se_col)
+  .validate_inputs(data, unit_col, time_col, value_col, se_col, trials_col, family)
 
   # --- Build a clean data.frame with standardised columns ---
-  # We construct from scratch rather than using := to avoid data.table
-  # internal state issues that cause gforce segfaults.
   unit_vec  <- data[[unit_col]]
   time_vec  <- data[[time_col]]
   value_vec <- data[[value_col]]
+
+  # For cumulative family: convert factor to integer levels if needed
+  if (family == "cumulative" && is.factor(value_vec)) {
+    value_vec <- as.integer(value_vec)
+  }
 
   # Convert Date/POSIXct to numeric fractional years
   if (inherits(time_vec, "Date") || inherits(time_vec, "POSIXct")) {
@@ -65,8 +78,8 @@ dlvm_prepare <- function(data,
       (as.numeric(format(time_vec, "%j")) - 1) / 365.25
   }
 
-  # Handle SE column
-  has_se <- !is.null(se_col) && se_col %in% names(data)
+  # Handle SE column (student_t only)
+  has_se <- !is.null(se_col) && se_col %in% names(data) && family == "student_t"
   se_vec <- if (has_se) {
     sv <- data[[se_col]]
     sv[is.na(sv) | sv <= 0] <- 0
@@ -75,7 +88,14 @@ dlvm_prepare <- function(data,
     rep(0, length(value_vec))
   }
 
-  # Build work data.frame (base R to avoid data.table internals)
+  # Handle trials column (binomial only)
+  trials_vec <- if (family == "binomial") {
+    data[[trials_col]]
+  } else {
+    NULL
+  }
+
+  # Build work data.frame
   df <- data.frame(
     unit  = unit_vec,
     time  = time_vec,
@@ -83,6 +103,9 @@ dlvm_prepare <- function(data,
     se    = se_vec,
     stringsAsFactors = FALSE
   )
+  if (!is.null(trials_vec)) {
+    df$trials <- trials_vec
+  }
 
   # Remove rows where value is NA
   n_before <- nrow(df)
@@ -116,21 +139,62 @@ dlvm_prepare <- function(data,
     }
   }
 
-  if (mode == "means" && max_rows_per_ut > 1) {
+  # --- Mode restrictions by family ---
+  if (mode == "means" && family == "cumulative") {
+    stop("[dlvm] mode='means' is not supported for the cumulative (ordinal) family. ",
+         "Ordinal observations cannot be meaningfully averaged. Use mode='individual'.")
+  }
+
+  # --- Bernoulli in means mode → auto-convert to binomial ---
+  if (mode == "means" && family == "bernoulli" && max_rows_per_ut > 1) {
+    message("[dlvm] Auto-converting bernoulli in means mode to binomial (summing successes and trials per cell).")
+    split_idx <- split(seq_len(nrow(df)), ut_key)
+    agg_list <- lapply(split_idx, function(idx) {
+      data.frame(
+        unit    = df$unit[idx[1]],
+        time    = df$time[idx[1]],
+        value   = sum(df$value[idx]),  # successes
+        se      = 0,
+        trials  = length(idx),         # trials
+        stringsAsFactors = FALSE
+      )
+    })
+    df <- do.call(rbind, agg_list)
+    rownames(df) <- NULL
+    family <- "binomial"
+    # Recalculate keys after aggregation to prevent double-aggregation
+    ut_key <- paste(df$unit, df$time, sep = "|||")
+    rows_per_ut <- table(ut_key)
+    max_rows_per_ut <- max(rows_per_ut)
+    message(sprintf("[dlvm] Converted to binomial: %d cells.", nrow(df)))
+  }
+
+  # --- Binomial aggregation: sum successes and trials per cell ---
+  if (mode == "means" && family == "binomial" && max_rows_per_ut > 1) {
+    ut_key <- paste(df$unit, df$time, sep = "|||")
+    split_idx <- split(seq_len(nrow(df)), ut_key)
+    agg_list <- lapply(split_idx, function(idx) {
+      data.frame(
+        unit    = df$unit[idx[1]],
+        time    = df$time[idx[1]],
+        value   = sum(df$value[idx]),
+        se      = 0,
+        trials  = sum(df$trials[idx]),
+        stringsAsFactors = FALSE
+      )
+    })
+    df <- do.call(rbind, agg_list)
+    rownames(df) <- NULL
+    message(sprintf("[dlvm] Aggregated binomial data: %d cells.", nrow(df)))
+  }
+
+  # --- Student-t aggregation (existing logic) ---
+  if (mode == "means" && family == "student_t" && max_rows_per_ut > 1) {
     message("[dlvm] mode='means' but multiple rows per unit-time found. Aggregating to means.")
 
-    # Compute global sigma_hat as proxy SE for n=1 cells.
-    # A single observation is one draw from the observation distribution,
-    # so sd(y) is the right order-of-magnitude uncertainty for it as an
-    # estimator of theta.  Setting SE=0 (as before) would paradoxically
-    # give n=1 cells maximum precision — more influence than well-measured
-    # means from many observations.
     sigma_hat <- sd(df$value, na.rm = TRUE)
-
-    # Count how many n=1 cells we have (for diagnostics)
     n1_count <- sum(vapply(split(seq_len(nrow(df)), ut_key), length, integer(1)) == 1L)
 
-    # Aggregate using base R split/lapply
     split_idx <- split(seq_len(nrow(df)), ut_key)
     agg_list <- lapply(split_idx, function(idx) {
       vals <- df$value[idx]
@@ -140,7 +204,6 @@ dlvm_prepare <- function(data,
       if (has_se) {
         agg_se <- sqrt(mean(ses^2, na.rm = TRUE)) / sqrt(n)
       } else {
-        # Calculate SEM from sample SD
         if (n > 1) {
           if (se_correction) {
             agg_se <- dlvm_se_cureton(vals, na.rm = TRUE)
@@ -148,7 +211,6 @@ dlvm_prepare <- function(data,
             agg_se <- sd(vals, na.rm = TRUE) / sqrt(n)
           }
         } else {
-          # n=1: use global sigma_hat as proxy SE
           agg_se <- sigma_hat
         }
       }
@@ -177,7 +239,6 @@ dlvm_prepare <- function(data,
   n_units <- length(units)
   all_times <- sort(unique(df$time))
 
-  # Create full state grid: all units × all times (using expand.grid, not CJ)
   state_grid <- expand.grid(unit = units, time = all_times,
                             stringsAsFactors = FALSE)
   state_grid <- state_grid[order(state_grid$unit, state_grid$time), , drop = FALSE]
@@ -196,7 +257,6 @@ dlvm_prepare <- function(data,
   }
 
   # --- Map observations to states ---
-  # Create a lookup key for state_grid
   sg_key <- paste(state_grid$unit, state_grid$time, sep = "|||")
   df_key <- paste(df$unit, df$time, sep = "|||")
   df$state_id <- state_grid$state_id[match(df_key, sg_key)]
@@ -205,39 +265,43 @@ dlvm_prepare <- function(data,
     stop("[dlvm] Internal error: some observations could not be mapped to latent states.")
   }
 
-  # --- Assemble Stan data list ---
+  # --- Assemble Stan data list (family-specific) ---
   n_states <- nrow(state_grid)
   n_obs <- nrow(df)
-  se_final <- if (has_se) df$se else rep(0, n_obs)
 
-  # --- Compute obs_n (observation count per cell) ---
-  # In individual mode, each row is one observation → obs_n = 1.
-  # In aggregated means mode, obs_n was computed during aggregation.
-  # If data was already pre-aggregated (1 row per unit-time from the start),
-  # obs_n defaults to 1 (no averaging benefit to claim).
-  if ("obs_n" %in% names(df)) {
-    obs_n_vec <- as.integer(df$obs_n)
-  } else {
-    obs_n_vec <- rep(1L, n_obs)
-  }
-
+  # Shared data across all families
   stan_data <- list(
-    n_states = n_states,
-    n_obs = n_obs,
-    n_units = n_units,
-    y = df$value,
+    n_states    = n_states,
+    n_obs       = n_obs,
+    n_units     = n_units,
     obs_to_state = as.integer(df$state_id),
-    has_se = as.integer(has_se && any(se_final > 0)),
-    se = se_final,
-    obs_n = obs_n_vec,
-    state_prev = as.integer(state_grid$prev_state_id),
-    delta_t = state_grid$delta_t,
-    nu_obs = nu_obs,
-    nu_state = nu_state,
+    state_prev  = as.integer(state_grid$prev_state_id),
+    delta_t     = state_grid$delta_t,
+    nu_state    = nu_state,
     scale_state = scale_state,
-    grainsize = as.integer(grainsize),
-    compute_gq = as.integer(compute_gq)
+    grainsize   = as.integer(grainsize),
+    compute_gq  = as.integer(compute_gq)
   )
+
+  # Family-specific data
+  if (family == "student_t") {
+    se_final <- if (has_se) df$se else rep(0, n_obs)
+    obs_n_vec <- if ("obs_n" %in% names(df)) as.integer(df$obs_n) else rep(1L, n_obs)
+    stan_data$y      <- df$value
+    stan_data$has_se  <- as.integer(has_se && any(se_final > 0))
+    stan_data$se      <- se_final
+    stan_data$obs_n   <- obs_n_vec
+    stan_data$nu_obs  <- nu_obs
+  } else if (family == "cumulative") {
+    K <- as.integer(max(df$value))
+    stan_data$y <- as.integer(df$value)
+    stan_data$K <- K
+  } else if (family == "bernoulli") {
+    stan_data$y <- as.integer(df$value)
+  } else if (family == "binomial") {
+    stan_data$y        <- as.integer(df$value)
+    stan_data$n_trials <- as.integer(df$trials)
+  }
 
   # --- Rename for user-facing output ---
   names(state_grid)[names(state_grid) == "unit"] <- unit_col
@@ -248,23 +312,25 @@ dlvm_prepare <- function(data,
 
   # --- Build metadata for post-processing ---
   metadata <- list(
-    unit_col = unit_col,
-    time_col = time_col,
-    value_col = value_col,
-    se_col = se_col,
-    mode = mode,
-    n_states = n_states,
-    n_obs = n_obs,
-    n_units = n_units,
-    units = units,
-    times = all_times,
+    unit_col   = unit_col,
+    time_col   = time_col,
+    value_col  = value_col,
+    se_col     = se_col,
+    trials_col = trials_col,
+    family     = family,
+    mode       = mode,
+    n_states   = n_states,
+    n_obs      = n_obs,
+    n_units    = n_units,
+    units      = units,
+    times      = all_times,
     state_grid = state_grid,
-    obs_data = df
+    obs_data   = df
   )
 
   message(sprintf(
-    "[dlvm] Prepared: %d units x %d time points = %d latent states, %d observations (%s mode).",
-    n_units, length(all_times), n_states, n_obs, mode
+    "[dlvm] Prepared: %d units x %d time points = %d latent states, %d observations (family: %s, mode: %s).",
+    n_units, length(all_times), n_states, n_obs, family, mode
   ))
 
   structure(
@@ -277,7 +343,7 @@ dlvm_prepare <- function(data,
 # Input validation (internal)
 # ============================================================================
 
-.validate_inputs <- function(data, unit_col, time_col, value_col, se_col) {
+.validate_inputs <- function(data, unit_col, time_col, value_col, se_col, trials_col, family) {
   if (!is.data.frame(data)) {
     stop("[dlvm] 'data' must be a data.frame or data.table.")
   }
@@ -292,23 +358,72 @@ dlvm_prepare <- function(data,
          "\n  Available columns: ", paste(names(data), collapse = ", "))
   }
 
-  if (!is.null(se_col) && !se_col %in% names(data)) {
-    stop("[dlvm] SE column '", se_col, "' not found in data.",
-         "\n  Available columns: ", paste(names(data), collapse = ", "))
-  }
-
-  if (!is.numeric(data[[value_col]])) {
-    stop("[dlvm] Value column '", value_col, "' must be numeric.")
-  }
-
   if (!is.numeric(data[[time_col]]) &&
       !inherits(data[[time_col]], "Date") &&
       !inherits(data[[time_col]], "POSIXct")) {
     stop("[dlvm] Time column '", time_col, "' must be numeric, Date, or POSIXct.")
   }
 
-  if (!is.null(se_col) && !is.numeric(data[[se_col]])) {
-    stop("[dlvm] SE column '", se_col, "' must be numeric.")
+  # Family-specific value column validation
+  if (family == "student_t") {
+    if (!is.numeric(data[[value_col]])) {
+      stop("[dlvm] Value column '", value_col, "' must be numeric for family='student_t'.")
+    }
+    if (!is.null(se_col) && !se_col %in% names(data)) {
+      stop("[dlvm] SE column '", se_col, "' not found in data.",
+           "\n  Available columns: ", paste(names(data), collapse = ", "))
+    }
+    if (!is.null(se_col) && !is.numeric(data[[se_col]])) {
+      stop("[dlvm] SE column '", se_col, "' must be numeric.")
+    }
+
+  } else if (family == "cumulative") {
+    vals <- data[[value_col]]
+    if (!is.integer(vals) && !is.factor(vals)) {
+      # Allow numeric that is integer-valued
+      if (is.numeric(vals) && all(vals == floor(vals), na.rm = TRUE)) {
+        # OK — will convert
+      } else {
+        stop("[dlvm] Value column '", value_col,
+             "' must be integer or factor for family='cumulative' (ordinal data).")
+      }
+    }
+    numeric_vals <- if (is.factor(vals)) as.integer(vals) else as.integer(vals)
+    if (min(numeric_vals, na.rm = TRUE) < 1) {
+      stop("[dlvm] Ordinal values must be >= 1 (got min = ",
+           min(numeric_vals, na.rm = TRUE), ").")
+    }
+    K <- max(numeric_vals, na.rm = TRUE)
+    if (K < 2) {
+      stop("[dlvm] Ordinal data must have at least 2 categories (K = ", K, ").")
+    }
+
+  } else if (family == "bernoulli") {
+    vals <- data[[value_col]]
+    if (!all(vals %in% c(0L, 1L, 0, 1, NA))) {
+      stop("[dlvm] Value column '", value_col,
+           "' must contain only 0 and 1 for family='bernoulli'.")
+    }
+
+  } else if (family == "binomial") {
+    if (is.null(trials_col)) {
+      stop("[dlvm] 'trials_col' is required for family='binomial'.")
+    }
+    if (!trials_col %in% names(data)) {
+      stop("[dlvm] Trials column '", trials_col, "' not found in data.",
+           "\n  Available columns: ", paste(names(data), collapse = ", "))
+    }
+    vals <- data[[value_col]]
+    trials <- data[[trials_col]]
+    if (!is.numeric(vals) || !is.numeric(trials)) {
+      stop("[dlvm] Value and trials columns must be numeric for family='binomial'.")
+    }
+    if (any(vals > trials, na.rm = TRUE)) {
+      stop("[dlvm] Some values exceed trial counts (successes > trials).")
+    }
+    if (any(vals < 0, na.rm = TRUE) || any(trials < 1, na.rm = TRUE)) {
+      stop("[dlvm] Values must be >= 0 and trials >= 1 for family='binomial'.")
+    }
   }
 }
 
@@ -320,11 +435,17 @@ dlvm_prepare <- function(data,
 print.dlvm_prepared <- function(x, ...) {
   m <- x$metadata
   cat(sprintf("DLVM prepared data:\n"))
+  cat(sprintf("  Family:       %s\n", m$family))
   cat(sprintf("  Units:        %d (%s)\n", m$n_units, m$unit_col))
   cat(sprintf("  Time range:   %.1f - %.1f (%s)\n",
               min(m$times), max(m$times), m$time_col))
   cat(sprintf("  Latent states: %d\n", m$n_states))
   cat(sprintf("  Observations:  %d (%s mode)\n", m$n_obs, m$mode))
-  cat(sprintf("  Has SE:        %s\n", ifelse(x$stan_data$has_se, "yes", "no")))
+  if (m$family == "student_t") {
+    cat(sprintf("  Has SE:        %s\n", ifelse(x$stan_data$has_se, "yes", "no")))
+  }
+  if (m$family == "cumulative") {
+    cat(sprintf("  Categories:    %d\n", x$stan_data$K))
+  }
   invisible(x)
 }

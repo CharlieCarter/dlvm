@@ -97,7 +97,15 @@ dlvm_parameters <- function(fit) {
   if (!inherits(fit, "dlvm_fit")) {
     stop("[dlvm] 'fit' must be a dlvm_fit object.")
   }
-  summ <- fit$fit$summary(variables = c("innov", "sigma"))
+  family <- fit$family %||% fit$metadata$family %||% "student_t"
+  if (family == "student_t") {
+    vars <- c("innov", "sigma")
+  } else if (family == "cumulative") {
+    vars <- c("innov", "cutpoints")
+  } else {
+    vars <- "innov"
+  }
+  summ <- fit$fit$summary(variables = vars)
   data.table::as.data.table(summ)
 }
 
@@ -253,6 +261,8 @@ dlvm_plot <- function(fit, units = NULL, show_obs = TRUE, prob = 0.95, ncol = NU
   if (show_obs) {
     obs_data <- as.data.frame(fit$metadata$obs_data)
     value_col <- fit$metadata$value_col
+    family <- fit$family %||% fit$metadata$family %||% "student_t"
+
     if (!is.null(obs_data) && value_col %in% names(obs_data)) {
       if (!is.null(units)) {
         obs_data <- obs_data[obs_data[[unit_col]] %in% units, ]
@@ -260,13 +270,23 @@ dlvm_plot <- function(fit, units = NULL, show_obs = TRUE, prob = 0.95, ncol = NU
       if (length(all_units) > 30 && is.null(units)) {
         obs_data <- obs_data[obs_data[[unit_col]] %in% all_units[1:30], ]
       }
-      p <- p + ggplot2::geom_point(
-        data = obs_data,
-        ggplot2::aes(y = .data[[value_col]]),
-        color = "#ef4444", size = 0.8, alpha = 0.4
-      )
+
+      # For binomial, plot proportions (successes/trials) instead of raw counts
+      if (family == "binomial" && "trials" %in% names(obs_data)) {
+        obs_data$obs_prop <- obs_data[[value_col]] / obs_data$trials
+        p <- p + ggplot2::geom_point(
+          data = obs_data,
+          ggplot2::aes(y = obs_prop),
+          color = "#ef4444", size = 0.8, alpha = 0.4
+        )
+      } else {
+        p <- p + ggplot2::geom_point(
+          data = obs_data,
+          ggplot2::aes(y = .data[[value_col]]),
+          color = "#ef4444", size = 0.8, alpha = 0.4
+        )
+      }
     } else if ("obs_mean" %in% names(summ)) {
-      # Fallback to aggregated means
       obs_subset <- summ[!is.na(summ$obs_mean), ]
       p <- p + ggplot2::geom_point(
         data = obs_subset,
@@ -281,8 +301,9 @@ dlvm_plot <- function(fit, units = NULL, show_obs = TRUE, prob = 0.95, ncol = NU
 
 #' Plot posterior predictive check
 #'
-#' Overlays replicated data (y_rep) from the posterior predictive distribution
-#' on the observed data to assess model fit.
+#' For continuous families: overlays replicated data (y_rep) density curves
+#' on the observed data density.
+#' For discrete families: compares observed and replicated frequency distributions.
 #'
 #' @param fit A dlvm_fit object.
 #' @param n_rep Integer; number of posterior predictive draws to overlay (default: 50).
@@ -293,6 +314,8 @@ dlvm_plot_ppc <- function(fit, n_rep = 50) {
     stop("[dlvm] Package 'ggplot2' required.")
   }
 
+  family <- fit$family %||% fit$metadata$family %||% "student_t"
+
   # Extract y_rep draws
   y_rep <- fit$fit$draws("y_rep", format = "matrix")
   y_obs <- fit$metadata$obs_data[[fit$metadata$value_col]]
@@ -302,31 +325,67 @@ dlvm_plot_ppc <- function(fit, n_rep = 50) {
   n_draws <- nrow(y_rep)
   draw_idx <- sample(n_draws, min(n_rep, n_draws))
 
-  # Build long-format data for y_rep
-  rep_list <- lapply(draw_idx, function(d) {
-    data.frame(value = y_rep[d, ], draw = d, type = "y_rep")
-  })
-  rep_df <- do.call(rbind, rep_list)
-  obs_df <- data.frame(value = y_obs, draw = 0, type = "y_obs")
+  if (family == "student_t") {
+    # --- Continuous: density overlay ---
+    rep_list <- lapply(draw_idx, function(d) {
+      data.frame(value = y_rep[d, ], draw = d, type = "y_rep")
+    })
+    rep_df <- do.call(rbind, rep_list)
+    obs_df <- data.frame(value = y_obs, draw = 0, type = "y_obs")
 
-  p <- ggplot2::ggplot() +
-    ggplot2::geom_density(
-      data = rep_df,
-      ggplot2::aes(x = value, group = factor(draw)),
-      color = "#93c5fd", alpha = 0.3, linewidth = 0.3
-    ) +
-    ggplot2::geom_density(
-      data = obs_df,
-      ggplot2::aes(x = value),
-      color = "#1d4ed8", linewidth = 1.2
-    ) +
-    ggplot2::labs(
-      x = "Value",
-      y = "Density",
-      title = "Posterior Predictive Check",
-      subtitle = sprintf("Dark blue = observed, light blue = %d posterior predictive draws", length(draw_idx))
-    ) +
-    ggplot2::theme_minimal(base_size = 12)
+    p <- ggplot2::ggplot() +
+      ggplot2::geom_density(
+        data = rep_df,
+        ggplot2::aes(x = value, group = factor(draw)),
+        color = "#93c5fd", alpha = 0.3, linewidth = 0.3
+      ) +
+      ggplot2::geom_density(
+        data = obs_df,
+        ggplot2::aes(x = value),
+        color = "#1d4ed8", linewidth = 1.2
+      ) +
+      ggplot2::labs(
+        x = "Value",
+        y = "Density",
+        title = "Posterior Predictive Check",
+        subtitle = sprintf("Dark blue = observed, light blue = %d posterior predictive draws", length(draw_idx))
+      ) +
+      ggplot2::theme_minimal(base_size = 12)
+
+  } else {
+    # --- Discrete: bar chart comparison ---
+    obs_tab <- as.data.frame(table(y_obs))
+    names(obs_tab) <- c("value", "count")
+    obs_tab$type <- "Observed"
+    obs_tab$count <- obs_tab$count / sum(obs_tab$count)  # proportions
+
+    # Average replicated distribution across draws
+    rep_tabs <- lapply(draw_idx, function(d) {
+      tab <- table(factor(y_rep[d, ], levels = obs_tab$value))
+      tab / sum(tab)
+    })
+    avg_rep <- Reduce("+", rep_tabs) / length(rep_tabs)
+    rep_tab <- data.frame(
+      value = names(avg_rep),
+      count = as.numeric(avg_rep),
+      type = "Replicated (avg)"
+    )
+
+    ppc_df <- rbind(obs_tab, rep_tab)
+    ppc_df$value <- factor(ppc_df$value)
+
+    p <- ggplot2::ggplot(ppc_df, ggplot2::aes(x = value, y = count, fill = type)) +
+      ggplot2::geom_col(position = "dodge", alpha = 0.8) +
+      ggplot2::scale_fill_manual(values = c("Observed" = "#1d4ed8", "Replicated (avg)" = "#93c5fd")) +
+      ggplot2::labs(
+        x = "Value",
+        y = "Proportion",
+        fill = NULL,
+        title = "Posterior Predictive Check (Discrete)",
+        subtitle = sprintf("Average of %d posterior predictive draws", length(draw_idx))
+      ) +
+      ggplot2::theme_minimal(base_size = 12)
+  }
 
   return(p)
 }

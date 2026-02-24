@@ -14,6 +14,18 @@
 //   Obs:     y[i] ~ student_t(nu_obs, theta[cy_id[i]], sigma_eff[i])
 //            sigma_eff[i] = sqrt(sigma^2 + se[i]^2)  if SEM known
 //            sigma_eff[i] = sigma                     if SEM unknown
+//
+// NOTE on the two Student-t distributions:
+//   nu_obs   → controls the OBSERVATION distribution's tails (likelihood).
+//              Determines how much a single extreme y[i] can pull theta.
+//   nu_state → controls the INNOVATION distribution's tails (state process).
+//              Determines how large structural breaks in the latent trajectory
+//              can be.  This is the "robust" property from Reuning et al.
+//   These are orthogonal: nu_obs is about measurement noise robustness,
+//   nu_state is about structural break accommodation.
+//
+// TODO: Systematic exploration of nu_obs impact on latent state recovery
+//       under different outlier regimes.
 
 functions {
   /**

@@ -54,8 +54,11 @@ dlvm_fit <- function(prepared_data,
   }
 
   # --- Compile model ---
+  family <- prepared_data$metadata$family
+  if (is.null(family)) family <- "student_t"  # backward compat
+
   t_compile_start <- proc.time()["elapsed"]
-  mod <- dlvm_compile(quiet = !show_messages)
+  mod <- dlvm_compile(family = family, quiet = !show_messages)
   t_compile <- proc.time()["elapsed"] - t_compile_start
 
   # --- Run sampler ---
@@ -146,7 +149,8 @@ dlvm_fit <- function(prepared_data,
     list(
       fit = fit,
       metadata = prepared_data$metadata,
-      timing = timing
+      timing = timing,
+      family = family
     ),
     class = "dlvm_fit"
   )
@@ -162,7 +166,9 @@ dlvm_fit <- function(prepared_data,
 print.dlvm_fit <- function(x, ...) {
   m <- x$metadata
   t <- x$timing
+  family <- x$family %||% m$family %||% "student_t"
   cat("DLVM fit:\n")
+  cat(sprintf("  Family:        %s\n", family))
   cat(sprintf("  Units:        %d\n", m$n_units))
   cat(sprintf("  Time range:   %.1f – %.1f\n", min(m$times), max(m$times)))
   cat(sprintf("  Latent states: %d\n", m$n_states))
@@ -173,8 +179,9 @@ print.dlvm_fit <- function(x, ...) {
               fmt_duration(t$sampling_secs)))
 
   # Quick diagnostics
+  diag_vars <- if (family == "student_t") c("innov", "sigma") else "innov"
   diag <- tryCatch({
-    summ <- x$fit$summary(variables = c("innov", "sigma"))
+    summ <- x$fit$summary(variables = diag_vars)
     div <- x$fit$diagnostic_summary(quiet = TRUE)
     list(
       max_rhat = max(summ$rhat, na.rm = TRUE),

@@ -92,6 +92,28 @@ test_that("means mode aggregates multi-obs correctly", {
   expect_equal(prep$stan_data$has_se, 1L) # SEM computed from aggregation
 })
 
+# --- n=1 SE proxy ---
+test_that("n=1 cells get sigma_hat proxy SE, not zero", {
+  set.seed(99)
+  # Create data where some country-years have 1 obs, others have many
+  df <- data.frame(
+    country = c(rep("USA", 12), rep("GBR", 1)),
+    year    = c(rep(2010:2012, each = 4), 2010),
+    score   = rnorm(13, sd = 0.5)
+  )
+  prep <- dlvm_prepare(df, "country", "year", "score", mode = "means")
+
+  # GBR-2010 has n=1 and should get se = sd(all_values), not 0
+  se_vals <- prep$stan_data$se
+  expect_true(all(se_vals > 0))
+
+  # The proxy SE should equal sd(df$score)
+  sigma_hat <- sd(df$score)
+  obs_data <- prep$metadata$obs_data
+  gbr_obs <- obs_data[obs_data$country == "GBR", ]
+  expect_equal(gbr_obs$se[1], sigma_hat, tolerance = 1e-10)
+})
+
 # --- delta_t computation ---
 test_that("delta_t is 1.0 for annual data", {
   df <- data.frame(

@@ -85,6 +85,7 @@ expect_gte <- function(a, b) if (!(a >= b)) stop(sprintf("Expected %g >= %g", a,
 # Run selected test suites
 test_files <- list(
   data_prep  = "test_data_prep.R",
+  families   = "test_families.R",
   simulation = "test_simulation.R",
   real_data  = "test_real_data.R",
   edge_cases = "test_edge_cases.R",

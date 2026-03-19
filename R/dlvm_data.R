@@ -30,7 +30,11 @@
 #'   Primary values: "student_t", "cumulative", "bernoulli", "binomial".
 #'   Aliases: "continuous" (→ student_t), "ordinal" (→ cumulative), "binary" (→ bernoulli).
 #' @param mode Character; one of "auto", "means", or "individual".
-#' @param nu_obs Numeric; degrees of freedom for observation distribution (default: 4, student_t only).
+#' @param nu_obs Numeric or NULL; degrees of freedom for observation distribution
+#'   (student_t family only). If NULL (default), a mode-dependent value is used:
+#'   4 for individual mode (doc-level scores can be genuine outliers) and 30 for
+#'   means mode (by CLT, cell means are approximately normal, and the SEM already
+#'   captures precision heterogeneity across cells).
 #' @param nu_state Numeric; degrees of freedom for state innovations (default: 4).
 #' @param scale_state Numeric; scale for state innovation prior (default: 4).
 #' @param grainsize Integer; reduce_sum grainsize (default: 1 = automatic).
@@ -49,7 +53,7 @@ dlvm_prepare <- function(data,
                          se_correction = TRUE,
                          family = "student_t",
                          mode = c("auto", "means", "individual"),
-                         nu_obs = 4,
+                         nu_obs = NULL,
                          nu_state = 4,
                          scale_state = 4,
                          grainsize = 1L,
@@ -136,6 +140,23 @@ dlvm_prepare <- function(data,
     } else {
       mode <- "means"
       message("[dlvm] Auto-detected mode: 'means' (1 obs per unit-time).")
+    }
+  }
+
+  # --- Resolve mode-dependent nu_obs ---
+  # For student_t family, individual doc-level scores can be genuine outliers
+  # (unusual use of a term, atypical context), so nu_obs = 4 gives appropriate
+  # heavy-tailed robustness. For means mode, the Central Limit Theorem implies
+  # cell means are approximately normal even if individual scores are not, and
+  # the SEM (se_col / sqrt(n) scaling) already captures per-cell precision
+  # heterogeneity — so heavy tails are redundant and weaken informativeness.
+  # nu_obs = 30 is approximately Gaussian while retaining minimal tail protection.
+  if (is.null(nu_obs)) {
+    if (family == "student_t") {
+      nu_obs <- if (mode == "means") 30 else 4
+      message(sprintf("[dlvm] Using mode-dependent nu_obs = %g (mode: %s).", nu_obs, mode))
+    } else {
+      nu_obs <- 4  # non-student_t families don't use nu_obs, but set a default
     }
   }
 

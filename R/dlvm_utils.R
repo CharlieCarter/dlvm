@@ -191,49 +191,47 @@ dlvm_compile <- function(family = "student_t", force = FALSE, quiet = FALSE, thr
     stop("[dlvm] Stan model not found at: ", stan_file)
   }
 
-  # Determine binary output path (next to the .stan file)
-  exe_file <- sub("\\.stan$", "", stan_file)
+  if (!quiet) {
+    threading_str <- if (threads) "with threading" else "without threading"
+    message(sprintf("[dlvm] Compiling Stan model (family: %s) %s via cmdstanr...", family, threading_str))
+  }
 
-  # Check if we can skip compilation (binary exists and is newer than .stan)
-  if (!force && file.exists(exe_file) &&
-      file.mtime(exe_file) > file.mtime(stan_file)) {
-    if (!quiet) message(sprintf("[dlvm] Using existing compiled binary (family: %s).", family))
-  } else {
-    # Compile via CmdStan's make system, which handles TBB linking correctly
-    cmdstan_dir <- cmdstanr::cmdstan_path()
-    make_args <- sprintf("STANCFLAGS='--O1'")
-    if (threads) {
-      make_args <- paste(make_args, "STAN_THREADS=TRUE")
-    }
-
-    make_cmd <- sprintf(
-      "cd '%s' && make '%s' %s",
-      cmdstan_dir, exe_file, make_args
-    )
-
-    if (!quiet) {
-      threading_str <- if (threads) "with threading" else "without threading"
-      message(sprintf("[dlvm] Compiling Stan model (family: %s) %s via CmdStan make...", family, threading_str))
-    }
-
-    result <- system(make_cmd, intern = FALSE, ignore.stdout = quiet, ignore.stderr = quiet)
-
-    if (result != 0) {
-      stop("[dlvm] Stan model compilation failed. Check CmdStan configuration.\n",
-           "  Hint: run  cmdstanr::rebuild_cmdstan()  if CmdStan was recently updated.")
-    }
-
-    if (!file.exists(exe_file)) {
-      stop("[dlvm] Compilation appeared to succeed but binary not found at: ", exe_file)
+  # Ensure TBB is findable during compilation and sampling
+  tbb_path <- dlvm_tbb_lib_path()
+  if (!is.null(tbb_path) && .Platform$OS.type == "windows") {
+    tbb_native <- normalizePath(tbb_path, winslash = "/", mustWork = FALSE)
+    if (!grepl(tbb_native, Sys.getenv("PATH"), fixed = TRUE)) {
+      Sys.setenv(PATH = paste(tbb_native, Sys.getenv("PATH"), sep = ";"))
     }
   }
 
-  # Wrap the pre-compiled binary in a CmdStanModel object
-  # Pass cpp_options so cmdstanr knows about threading support
-  mod <- cmdstanr::cmdstan_model(
-    stan_file,
-    exe_file = exe_file,
-    cpp_options = if (threads) list(stan_threads = TRUE) else list()
+  # Remove stale cross-platform binaries (e.g. macOS binary synced to Windows via Dropbox)
+  exe_base <- sub("\\.stan$", "", stan_file)
+  stale_candidates <- c(exe_base, paste0(exe_base, ".exe"))
+  for (f in stale_candidates) {
+    if (force && file.exists(f)) {
+      unlink(f)
+    }
+  }
+
+  # Use cmdstanr's native compilation — handles platform differences, binary
+  # extensions (.exe on Windows), TBB linking, and incremental rebuilds.
+  cpp_opts <- if (threads) list(stan_threads = TRUE) else list()
+  stanc_opts <- list("O1" = TRUE)
+
+  mod <- tryCatch(
+    cmdstanr::cmdstan_model(
+      stan_file,
+      cpp_options = cpp_opts,
+      stanc_options = stanc_opts,
+      force_recompile = force,
+      quiet = quiet
+    ),
+    error = function(e) {
+      stop("[dlvm] Stan model compilation failed:\n  ", conditionMessage(e), "\n",
+           "  Hint: run  cmdstanr::rebuild_cmdstan()  if CmdStan was recently updated.",
+           call. = FALSE)
+    }
   )
 
   .dlvm_env[[cache_key]] <- mod
@@ -430,7 +428,7 @@ dlvm_setup_cmdstan <- function(force = FALSE, rebuild = FALSE, verbose = TRUE) {
 
   tbb_dir <- file.path(cmdstan_dir, "stan", "lib", "stan_math", "lib", "tbb")
   tbb_marker <- file.path(tbb_dir, "tbb-make-check")
-  tbb_dylibs <- list.files(tbb_dir, pattern = "\\.(dylib|so)$")
+  tbb_dylibs <- list.files(tbb_dir, pattern = "\\.(dylib|so|dll)$")
 
   if (file.exists(tbb_marker) && length(tbb_dylibs) == 0) {
     # Marker says built but no dylibs — remove marker + ancillary files
@@ -481,7 +479,7 @@ dlvm_setup_cmdstan <- function(force = FALSE, rebuild = FALSE, verbose = TRUE) {
     }
 
     # Verify TBB dylibs
-    rebuilt_dylibs <- list.files(tbb_dir, pattern = "\\.(dylib|so)$")
+    rebuilt_dylibs <- list.files(tbb_dir, pattern = "\\.(dylib|so|dll)$")
     if (length(rebuilt_dylibs) > 0) {
       if (verbose) message("[dlvm] TBB dylibs built: ",
                            paste(rebuilt_dylibs, collapse = ", "))

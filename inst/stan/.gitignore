@@ -1,0 +1,10 @@
+# Compiled Stan model binaries (platform-specific, never ship these)
+*
+!*.stan
+!.gitignore
+
+# Exploratory model variants — not yet integrated into package logic.
+# Re-ignored here because the !*.stan rule above would otherwise track them.
+dlvm_hier_sigma.stan
+dlvm_hier_sigma_n.stan
+dlvm_obs_n.stan

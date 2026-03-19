@@ -105,25 +105,40 @@ dlvm_fit <- function(prepared_data,
   extra_args <- list(...)
   sample_args <- c(sample_args, extra_args)
 
-  # Ensure CmdStan's TBB is found at runtime (not Homebrew's)
+  # Ensure CmdStan's TBB is found at runtime (DYLD on macOS, PATH on Windows)
   tbb_path <- dlvm_tbb_lib_path()
   old_dyld <- Sys.getenv("DYLD_LIBRARY_PATH", unset = NA)
+  old_path <- Sys.getenv("PATH", unset = NA)
+
   if (!is.null(tbb_path)) {
-    if (is.na(old_dyld) || old_dyld == "") {
-      Sys.setenv(DYLD_LIBRARY_PATH = tbb_path)
+    if (.Platform$OS.type == "windows") {
+      # Windows: TBB DLL must be on PATH
+      tbb_native <- normalizePath(tbb_path, winslash = "/", mustWork = FALSE)
+      if (!grepl(tbb_native, Sys.getenv("PATH"), fixed = TRUE)) {
+        Sys.setenv(PATH = paste(tbb_native, Sys.getenv("PATH"), sep = ";"))
+      }
     } else {
-      Sys.setenv(DYLD_LIBRARY_PATH = paste(tbb_path, old_dyld, sep = ":"))
+      # macOS / Linux: use DYLD_LIBRARY_PATH / LD_LIBRARY_PATH
+      if (is.na(old_dyld) || old_dyld == "") {
+        Sys.setenv(DYLD_LIBRARY_PATH = tbb_path)
+      } else {
+        Sys.setenv(DYLD_LIBRARY_PATH = paste(tbb_path, old_dyld, sep = ":"))
+      }
     }
   }
 
   fit <- tryCatch(
     do.call(mod$sample, sample_args),
     finally = {
-      # Restore original DYLD_LIBRARY_PATH
-      if (is.na(old_dyld)) {
-        Sys.unsetenv("DYLD_LIBRARY_PATH")
+      # Restore original environment
+      if (.Platform$OS.type == "windows") {
+        if (!is.na(old_path)) Sys.setenv(PATH = old_path)
       } else {
-        Sys.setenv(DYLD_LIBRARY_PATH = old_dyld)
+        if (is.na(old_dyld)) {
+          Sys.unsetenv("DYLD_LIBRARY_PATH")
+        } else {
+          Sys.setenv(DYLD_LIBRARY_PATH = old_dyld)
+        }
       }
     }
   )
